@@ -22,3 +22,7 @@ jobs:
         run: go test ./pkg/server/ -v -race -count=1 -timeout=60s
       - name: Run tests (no race)
         run: go test ./pkg/server/ -v -count=1 -timeout=30s
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
