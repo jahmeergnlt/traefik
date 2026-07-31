@@ -66,17 +66,59 @@ func (s *Server) Start(ctx context.Context) {
 	go s.watcher(ctx)
 }
 
+// Snapshot returns a deep copy of the configuration that the caller owns.
+// Providers MUST send the snapshot — not the original — so the config handed
+// through the channel is never shared with the provider's own maps:
+//
+//	s.GetConfigurationChan() <- myConfig.Snapshot()
+//
+// Sending the original and then mutating it after the send races with the
+// watcher regardless of anything the consumer does, so the snapshot-on-send
+// is the actual fix. The server's consumer-side copy (see copyConfig) is
+// additional defense-in-depth so GetConfig() can hand out a safe view.
+func (c Configuration) Snapshot() Configuration {
+	return copyConfig(c)
+}
+
 func (s *Server) watcher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case config := <-s.configurationChan:
-			s.switchConfigs(config)
+			// Copy under our own ownership before applying. This keeps the
+			// server from holding provider-owned map references, so a
+			// provider that honors the send contract can never have its
+			// config mutated underneath the watcher by the server itself.
+			s.switchConfigs(copyConfig(config))
 		}
 	}
 }
 
+// copyConfig copies a Configuration's maps. RouterConfig and MiddlewareConfig
+// are value-only structs (strings), so copying the maps is a full copy today.
+// If either struct ever gains reference fields, this must become a true deep
+// copy.
+func copyConfig(config Configuration) Configuration {
+	clone := Configuration{
+		Routers:     make(map[string]RouterConfig, len(config.Routers)),
+		Middlewares: make(map[string]MiddlewareConfig, len(config.Middlewares)),
+	}
+	for k, v := range config.Routers {
+		clone.Routers[k] = v
+	}
+	for k, v := range config.Middlewares {
+		clone.Middlewares[k] = v
+	}
+	return clone
+}
+
+// GetConfigurationChan returns the channel providers use to publish configs.
+//
+// OWNERSHIP CONTRACT: send a Configuration.Snapshot() value, or — if sending
+// an existing value — you must never mutate that value or its maps after the
+// send. A goroutine may not read from and write to the same map without
+// synchronization.
 func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
@@ -127,5 +169,6 @@ func (s *Server) GetEntryPoint(name string) *EntryPoint {
 func (s *Server) GetConfig() Configuration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.currentConfig
+	// Return a copy so callers can't mutate the live config maps.
+	return copyConfig(s.currentConfig)
 }
