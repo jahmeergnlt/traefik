@@ -66,25 +66,43 @@ func (s *Server) Start(ctx context.Context) {
 	go s.watcher(ctx)
 }
 
+// GetConfigurationChan returns the channel providers use to publish configs.
+//
+// OWNERSHIP CONTRACT: sending a Configuration transfers ownership of the
+// contained maps to the server. Providers MUST NOT mutate the Configuration —
+// or any map it references — after the send. A goroutine may not read from
+// and write to the same map without synchronization; any provider that
+// reuses a config after sending it is already racing regardless of what the
+// consumer does.
+//
+// The consumer-side copy in the watcher (see copyConfig) is defense-in-depth:
+// it guarantees the server never retains provider-owned references, so configs
+// that the provider DOES hand off cleanly can never be mutated under the
+// server's feet by later code, and GetConfig() can hand out a safe view.
+func (s *Server) GetConfigurationChan() chan<- Configuration {
+	return s.configurationChan
+}
+
 func (s *Server) watcher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case config := <-s.configurationChan:
-			// Deep-copy before processing. The config struct carries map
-			// references owned by the provider goroutine; if the provider
-			// reuses or mutates those maps after sending (common with
-			// buffered writers), iterating them here races. A snapshot
-			// makes the swap fully isolated.
-			s.switchConfigs(cloneConfig(config))
+			// Copy under our own ownership before applying. This keeps the
+			// server from holding provider-owned map references, so a
+			// provider that honors the send contract can never have its
+			// config mutated underneath the watcher by the server itself.
+			s.switchConfigs(copyConfig(config))
 		}
 	}
 }
 
-// cloneConfig returns a deep copy of a Configuration so the server never
-// retains references to provider-owned maps.
-func cloneConfig(config Configuration) Configuration {
+// copyConfig copies a Configuration's maps. RouterConfig and MiddlewareConfig
+// are value-only structs (strings), so copying the maps is a full copy today.
+// If either struct ever gains reference fields, this must become a true deep
+// copy.
+func copyConfig(config Configuration) Configuration {
 	clone := Configuration{
 		Routers:     make(map[string]RouterConfig, len(config.Routers)),
 		Middlewares: make(map[string]MiddlewareConfig, len(config.Middlewares)),
@@ -149,5 +167,5 @@ func (s *Server) GetConfig() Configuration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	// Return a copy so callers can't mutate the live config maps.
-	return cloneConfig(s.currentConfig)
+	return copyConfig(s.currentConfig)
 }
