@@ -80,16 +80,6 @@ func (c Configuration) Snapshot() Configuration {
 	return copyConfig(c)
 }
 
-// GetConfigurationChan returns the channel providers use to publish configs.
-//
-// OWNERSHIP CONTRACT: send a Configuration.Snapshot() value, or — if sending
-// an existing value — you must never mutate that value or its maps after the
-// send. A goroutine may not read from and write to the same map without
-// synchronization.
-func (s *Server) GetConfigurationChan() chan<- Configuration {
-	return s.configurationChan
-}
-
 func (s *Server) watcher(ctx context.Context) {
 	for {
 		select {
@@ -123,6 +113,12 @@ func copyConfig(config Configuration) Configuration {
 	return clone
 }
 
+// GetConfigurationChan returns the channel providers use to publish configs.
+//
+// OWNERSHIP CONTRACT: send a Configuration.Snapshot() value, or — if sending
+// an existing value — you must never mutate that value or its maps after the
+// send. A goroutine may not read from and write to the same map without
+// synchronization.
 func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
