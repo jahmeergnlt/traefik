@@ -72,9 +72,30 @@ func (s *Server) watcher(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case config := <-s.configurationChan:
-			s.switchConfigs(config)
+			// Deep-copy before processing. The config struct carries map
+			// references owned by the provider goroutine; if the provider
+			// reuses or mutates those maps after sending (common with
+			// buffered writers), iterating them here races. A snapshot
+			// makes the swap fully isolated.
+			s.switchConfigs(cloneConfig(config))
 		}
 	}
+}
+
+// cloneConfig returns a deep copy of a Configuration so the server never
+// retains references to provider-owned maps.
+func cloneConfig(config Configuration) Configuration {
+	clone := Configuration{
+		Routers:     make(map[string]RouterConfig, len(config.Routers)),
+		Middlewares: make(map[string]MiddlewareConfig, len(config.Middlewares)),
+	}
+	for k, v := range config.Routers {
+		clone.Routers[k] = v
+	}
+	for k, v := range config.Middlewares {
+		clone.Middlewares[k] = v
+	}
+	return clone
 }
 
 func (s *Server) GetConfigurationChan() chan<- Configuration {
@@ -127,5 +148,6 @@ func (s *Server) GetEntryPoint(name string) *EntryPoint {
 func (s *Server) GetConfig() Configuration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.currentConfig
+	// Return a copy so callers can't mutate the live config maps.
+	return cloneConfig(s.currentConfig)
 }
