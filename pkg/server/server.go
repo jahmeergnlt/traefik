@@ -66,19 +66,26 @@ func (s *Server) Start(ctx context.Context) {
 	go s.watcher(ctx)
 }
 
+// Snapshot returns a deep copy of the configuration that the caller owns.
+// Providers MUST send the snapshot — not the original — so the config handed
+// through the channel is never shared with the provider's own maps:
+//
+//	s.GetConfigurationChan() <- myConfig.Snapshot()
+//
+// Sending the original and then mutating it after the send races with the
+// watcher regardless of anything the consumer does, so the snapshot-on-send
+// is the actual fix. The server's consumer-side copy (see copyConfig) is
+// additional defense-in-depth so GetConfig() can hand out a safe view.
+func (c Configuration) Snapshot() Configuration {
+	return copyConfig(c)
+}
+
 // GetConfigurationChan returns the channel providers use to publish configs.
 //
-// OWNERSHIP CONTRACT: sending a Configuration transfers ownership of the
-// contained maps to the server. Providers MUST NOT mutate the Configuration —
-// or any map it references — after the send. A goroutine may not read from
-// and write to the same map without synchronization; any provider that
-// reuses a config after sending it is already racing regardless of what the
-// consumer does.
-//
-// The consumer-side copy in the watcher (see copyConfig) is defense-in-depth:
-// it guarantees the server never retains provider-owned references, so configs
-// that the provider DOES hand off cleanly can never be mutated under the
-// server's feet by later code, and GetConfig() can hand out a safe view.
+// OWNERSHIP CONTRACT: send a Configuration.Snapshot() value, or — if sending
+// an existing value — you must never mutate that value or its maps after the
+// send. A goroutine may not read from and write to the same map without
+// synchronization.
 func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
