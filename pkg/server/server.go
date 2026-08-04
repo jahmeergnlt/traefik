@@ -26,15 +26,19 @@ type Configuration struct {
 	Middlewares map[string]MiddlewareConfig
 }
 
+type entryPointHandler struct {
+	handler http.Handler
+}
+
 // EntryPoint represents an entrypoint.
 type EntryPoint struct {
-	handler atomic.Value // holds http.Handler
+	handler atomic.Value // holds *entryPointHandler
 }
 
 func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := e.handler.Load()
 	if h != nil {
-		h.(http.Handler).ServeHTTP(w, r)
+		h.(*entryPointHandler).handler.ServeHTTP(w, r)
 	} else {
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
@@ -56,9 +60,9 @@ func NewServer() *Server {
 		},
 	}
 	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.entryPoints["web"].handler.Store(&entryPointHandler{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	})})
 	return s
 }
 
@@ -72,8 +76,18 @@ func (s *Server) watcher(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case config := <-s.configurationChan:
-			s.switchConfigs(config)
+			config = copyConfiguration(config)
+			for {
+				select {
+				case nextConfig := <-s.configurationChan:
+					config = copyConfiguration(nextConfig)
+				default:
+					s.switchConfigs(config)
+					goto nextIteration
+				}
+			}
 		}
+	nextIteration:
 	}
 }
 
@@ -81,16 +95,21 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
 
+func (s *Server) UpdateConfiguration(config Configuration) {
+	s.configurationChan <- copyConfiguration(config)
+}
+
 func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
+	snapshot := copyConfiguration(config)
+	s.currentConfig = snapshot
 
 	// Rebuild the entrypoint handler atomically as a single, immutable unit.
 	mux := http.NewServeMux()
 
-	for _, routerCfg := range config.Routers {
+	for _, routerCfg := range snapshot.Routers {
 		cfg := routerCfg
 		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -99,7 +118,7 @@ func (s *Server) switchConfigs(config Configuration) {
 
 		// Wrap with middleware if configured, using the configuration snapshot
 		if cfg.Middleware != "" {
-			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
+			if mwCfg, ok := snapshot.Middlewares[cfg.Middleware]; ok {
 				handler = s.buildMiddleware(mwCfg, handler)
 			}
 		}
@@ -108,7 +127,7 @@ func (s *Server) switchConfigs(config Configuration) {
 	}
 
 	// Swap the active entrypoint handler atomically
-	s.entryPoints["web"].handler.Store(mux)
+	s.entryPoints["web"].handler.Store(&entryPointHandler{handler: mux})
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
@@ -127,5 +146,38 @@ func (s *Server) GetEntryPoint(name string) *EntryPoint {
 func (s *Server) GetConfig() Configuration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.currentConfig
+	return copyConfiguration(s.currentConfig)
+}
+
+func copyConfiguration(config Configuration) Configuration {
+	return Configuration{
+		Routers:     copyRouterConfigs(config.Routers),
+		Middlewares: copyMiddlewareConfigs(config.Middlewares),
+	}
+}
+
+func copyRouterConfigs(source map[string]RouterConfig) map[string]RouterConfig {
+	if source == nil {
+		return nil
+	}
+
+	cloned := make(map[string]RouterConfig, len(source))
+	for name, routerCfg := range source {
+		cloned[name] = routerCfg
+	}
+
+	return cloned
+}
+
+func copyMiddlewareConfigs(source map[string]MiddlewareConfig) map[string]MiddlewareConfig {
+	if source == nil {
+		return nil
+	}
+
+	cloned := make(map[string]MiddlewareConfig, len(source))
+	for name, middlewareCfg := range source {
+		cloned[name] = middlewareCfg
+	}
+
+	return cloned
 }

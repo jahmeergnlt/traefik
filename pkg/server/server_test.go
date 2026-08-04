@@ -32,7 +32,7 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 			},
 		},
 	}
-	s.GetConfigurationChan() <- initialConfig
+	s.UpdateConfiguration(initialConfig)
 	time.Sleep(50 * time.Millisecond)
 
 	var wg sync.WaitGroup
@@ -66,7 +66,7 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 						},
 					},
 				}
-				s.GetConfigurationChan() <- configA
+				s.UpdateConfiguration(configA)
 				time.Sleep(2 * time.Millisecond)
 			}
 		}
@@ -101,7 +101,7 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 						},
 					},
 				}
-				s.GetConfigurationChan() <- configB
+				s.UpdateConfiguration(configB)
 				time.Sleep(2 * time.Millisecond)
 			}
 		}
@@ -141,4 +141,58 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	close(stopChan)
 	wg.Wait()
+}
+
+func TestConfigurationSnapshotIsolatedFromCallerMutation(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	config := Configuration{
+		Routers: map[string]RouterConfig{
+			"route1": {
+				Path:         "/test",
+				Middleware:   "mw1",
+				ResponseText: "Original Router",
+			},
+		},
+		Middlewares: map[string]MiddlewareConfig{
+			"mw1": {
+				HeaderName:  "X-Test-Header",
+				HeaderValue: "Original",
+			},
+		},
+	}
+
+	s.Start(ctx)
+
+	s.UpdateConfiguration(config)
+	config.Routers["route1"] = RouterConfig{
+		Path:         "/test",
+		Middleware:   "mw1",
+		ResponseText: "Mutated Router",
+	}
+	config.Middlewares["mw1"] = MiddlewareConfig{
+		HeaderName:  "X-Test-Header",
+		HeaderValue: "Mutated",
+	}
+
+	time.Sleep(50 * time.Millisecond)
+
+	ep := s.GetEntryPoint("web")
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	ep.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+
+	if body := rec.Body.String(); body != "Original Router" {
+		t.Fatalf("expected original router response, got %q", body)
+	}
+
+	if headerVal := rec.Header().Get("X-Test-Header"); headerVal != "Original" {
+		t.Fatalf("expected original middleware header, got %q", headerVal)
+	}
 }
