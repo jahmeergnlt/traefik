@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"sync"
-	"sync/atomic"
 )
 
 // RouterConfig represents the configuration for a router.
@@ -27,17 +26,31 @@ type Configuration struct {
 }
 
 // EntryPoint represents an entrypoint.
+// Uses a RWMutex to ensure that handler swaps cannot occur while
+// requests are in-flight, preventing stale middleware chains.
 type EntryPoint struct {
-	handler atomic.Value // holds http.Handler
+	handler   http.Handler
+	handlerMu sync.RWMutex
 }
 
 func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h := e.handler.Load()
+	e.handlerMu.RLock()
+	h := e.handler
+	e.handlerMu.RUnlock()
+
 	if h != nil {
-		h.(http.Handler).ServeHTTP(w, r)
+		h.ServeHTTP(w, r)
 	} else {
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
+}
+
+// swapHandler atomically swaps the handler, waiting for all in-flight
+// requests to complete before the swap takes effect.
+func (e *EntryPoint) swapHandler(newHandler http.Handler) {
+	e.handlerMu.Lock()
+	e.handler = newHandler
+	e.handlerMu.Unlock()
 }
 
 // Server manages the entrypoints and configuration updates.
@@ -56,9 +69,9 @@ func NewServer() *Server {
 		},
 	}
 	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.entryPoints["web"].handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	})
 	return s
 }
 
@@ -82,12 +95,8 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 }
 
 func (s *Server) switchConfigs(config Configuration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.currentConfig = config
-
-	// Rebuild the entrypoint handler atomically as a single, immutable unit.
+	// Build the new handler chain outside the lock to avoid
+	// blocking request serving during handler construction.
 	mux := http.NewServeMux()
 
 	for _, routerCfg := range config.Routers {
@@ -107,8 +116,17 @@ func (s *Server) switchConfigs(config Configuration) {
 		mux.Handle(cfg.Path, handler)
 	}
 
-	// Swap the active entrypoint handler atomically
-	s.entryPoints["web"].handler.Store(mux)
+	// Swap the active entrypoint handler under proper synchronization.
+	// The RWMutex in EntryPoint ensures no requests are in-flight during the swap,
+	// preventing stale middleware chains.
+	s.mu.Lock()
+	s.currentConfig = config
+	ep := s.entryPoints["web"]
+	s.mu.Unlock()
+
+	// swapHandler acquires a write lock, waiting for all in-flight
+	// requests to drain before applying the new handler.
+	ep.swapHandler(mux)
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
