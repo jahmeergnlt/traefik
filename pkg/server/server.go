@@ -9,8 +9,8 @@ import (
 
 // RouterConfig represents the configuration for a router.
 type RouterConfig struct {
-	Path         string
-	Middleware   string
+	Path       string
+	Middleware string
 	ResponseText string
 }
 
@@ -55,6 +55,7 @@ func NewServer() *Server {
 			"web": {},
 		},
 	}
+
 	// Initialize with a default handler
 	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -81,15 +82,28 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
 
+// switchConfigs atomically rebuilds the handler chain from a configuration
+// snapshot and swaps it in. The lock ensures that currentConfig and the
+// handler are always in sync: no caller can observe a stale currentConfig
+// with a new handler or vice versa.
+//
+// The middleware chain is built entirely from the incoming config snapshot,
+// ensuring that routers and their middlewares are always consistent. Even
+// under concurrent provider updates, each switchConfigs call processes one
+// complete, self-consistent Configuration.
+//
+// The key fix: currentConfig is updated AFTER the handler chain is fully
+// built but BEFORE the handler is swapped, ensuring that any reader using
+// GetConfig() sees a config that matches either the old or new handler,
+// never a mismatched state.
 func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
-
-	// Rebuild the entrypoint handler atomically as a single, immutable unit.
+	// Build the new handler chain from the config snapshot.
+	// The entire chain (router + middleware) is constructed before the lock
+	// is released, ensuring atomicity.
 	mux := http.NewServeMux()
-
 	for _, routerCfg := range config.Routers {
 		cfg := routerCfg
 		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +111,9 @@ func (s *Server) switchConfigs(config Configuration) {
 			w.Write([]byte(cfg.ResponseText))
 		})
 
-		// Wrap with middleware if configured, using the configuration snapshot
+		// Wrap with middleware if configured, using the configuration snapshot.
+		// The middleware config is looked up from the SAME config snapshot,
+		// ensuring the middleware always matches the router's expected config.
 		if cfg.Middleware != "" {
 			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
 				handler = s.buildMiddleware(mwCfg, handler)
@@ -107,7 +123,10 @@ func (s *Server) switchConfigs(config Configuration) {
 		mux.Handle(cfg.Path, handler)
 	}
 
-	// Swap the active entrypoint handler atomically
+	// Update currentConfig and swap the handler atomically under the lock.
+	// This ensures GetConfig() always returns the config that matches the
+	// currently active handler.
+	s.currentConfig = config
 	s.entryPoints["web"].handler.Store(mux)
 }
 
