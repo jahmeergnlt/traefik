@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -26,15 +27,19 @@ type Configuration struct {
 	Middlewares map[string]MiddlewareConfig
 }
 
+type handlerWrapper struct {
+	handler http.Handler
+}
+
 // EntryPoint represents an entrypoint.
 type EntryPoint struct {
-	handler atomic.Value // holds http.Handler
+	handler atomic.Value // holds handlerWrapper
 }
 
 func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := e.handler.Load()
 	if h != nil {
-		h.(http.Handler).ServeHTTP(w, r)
+		h.(handlerWrapper).handler.ServeHTTP(w, r)
 	} else {
 		http.Error(w, "Not Found", http.StatusNotFound)
 	}
@@ -56,9 +61,11 @@ func NewServer() *Server {
 		},
 	}
 	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	s.entryPoints["web"].handler.Store(handlerWrapper{
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+		}),
+	})
 	return s
 }
 
@@ -94,7 +101,9 @@ func (s *Server) switchConfigs(config Configuration) {
 		cfg := routerCfg
 		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(cfg.ResponseText))
+			if _, err := w.Write([]byte(cfg.ResponseText)); err != nil {
+				log.Printf("error writing response: %v", err)
+			}
 		})
 
 		// Wrap with middleware if configured, using the configuration snapshot
@@ -108,7 +117,7 @@ func (s *Server) switchConfigs(config Configuration) {
 	}
 
 	// Swap the active entrypoint handler atomically
-	s.entryPoints["web"].handler.Store(mux)
+	s.entryPoints["web"].handler.Store(handlerWrapper{handler: mux})
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
