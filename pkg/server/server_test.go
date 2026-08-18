@@ -142,3 +142,42 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	close(stopChan)
 	wg.Wait()
 }
+
+// TestConfigUpdateDoesNotPanic is a regression test for the atomic.Value
+// concrete-type mismatch: NewServer stored an http.HandlerFunc while
+// switchConfigs stores a *http.ServeMux. The first config update therefore
+// panicked with "store of inconsistently typed value into Value".
+func TestConfigUpdateDoesNotPanic(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	config := Configuration{
+		Routers: map[string]RouterConfig{
+			"route1": {Path: "/test", Middleware: "mw1", ResponseText: "Hello"},
+		},
+		Middlewares: map[string]MiddlewareConfig{
+			"mw1": {HeaderName: "X-Test-Header", HeaderValue: "v1"},
+		},
+	}
+	s.GetConfigurationChan() <- config
+
+	// Give the watcher time to process the update; a panic would fail the test.
+	time.Sleep(50 * time.Millisecond)
+
+	ep := s.GetEntryPoint("web")
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	ep.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != "Hello" {
+		t.Fatalf("expected body %q, got %q", "Hello", got)
+	}
+	if got := rec.Header().Get("X-Test-Header"); got != "v1" {
+		t.Fatalf("expected header %q, got %q", "v1", got)
+	}
+}
