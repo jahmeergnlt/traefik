@@ -55,10 +55,15 @@ func NewServer() *Server {
 			"web": {},
 		},
 	}
-	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Initialize with a default *http.ServeMux so the atomic.Value concrete
+	// type stays consistent with the handler stored in switchConfigs. Storing
+	// a different concrete type (e.g. http.HandlerFunc) here would make the
+	// first config update panic with "store of inconsistently typed value".
+	defaultMux := http.NewServeMux()
+	defaultMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	})
+	s.entryPoints["web"].handler.Store(defaultMux)
 	return s
 }
 
