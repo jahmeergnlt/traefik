@@ -108,6 +108,7 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	}()
 
 	// Send a continuous stream of HTTP requests to the router
+	violations := make(chan string, 1000)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -123,14 +124,14 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 
 				if body == "New Router" {
 					if headerVal != "New" {
-						t.Errorf("Consistency violation: response body is %q but header is %q", body, headerVal)
+						violations <- "Consistency violation: response body is New Router but header is " + headerVal
 					}
 				} else if body == "Old Router" {
 					if headerVal != "Old" {
-						t.Errorf("Consistency violation: response body is %q but header is %q", body, headerVal)
+						violations <- "Consistency violation: response body is Old Router but header is " + headerVal
 					}
 				} else {
-					t.Errorf("Unexpected response body: %q", body)
+					violations <- "Unexpected response body: " + body
 				}
 			}
 			time.Sleep(1 * time.Millisecond)
@@ -141,4 +142,173 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	close(stopChan)
 	wg.Wait()
+	close(violations)
+
+	violationCount := 0
+	for v := range violations {
+		t.Error(v)
+		violationCount++
+	}
+	if violationCount == 0 {
+		t.Log("No consistency violations detected")
+	}
+}
+
+func TestConfigSwapAtomicity(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.Start(ctx)
+
+	// Send config A
+	configA := Configuration{
+		Routers: map[string]RouterConfig{
+			"r1": {Path: "/a", ResponseText: "ConfigA"},
+		},
+		Middlewares: map[string]MiddlewareConfig{},
+	}
+	s.GetConfigurationChan() <- configA
+	time.Sleep(50 * time.Millisecond)
+
+	// Rapidly alternate between two configs
+	var wg sync.WaitGroup
+	stopChan := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopChan:
+				return
+			default:
+				s.GetConfigurationChan() <- configA
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	configB := Configuration{
+		Routers: map[string]RouterConfig{
+			"r1": {Path: "/a", ResponseText: "ConfigB"},
+		},
+		Middlewares: map[string]MiddlewareConfig{},
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stopChan:
+				return
+			default:
+				s.GetConfigurationChan() <- configB
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Verify that GetConfig always returns a consistent snapshot
+	// and that the response body is always one of the valid values
+	invalidResponses := make(chan string, 1000)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ep := s.GetEntryPoint("web")
+		for i := 0; i < 500; i++ {
+			req := httptest.NewRequest(http.MethodGet, "/a", nil)
+			rec := httptest.NewRecorder()
+			ep.ServeHTTP(rec, req)
+
+			if rec.Code == http.StatusOK {
+				body := rec.Body.String()
+				if body != "ConfigA" && body != "ConfigB" {
+					invalidResponses <- "Invalid response: " + body
+				}
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			cfg := s.GetConfig()
+			// Verify that the config returned is a valid snapshot
+			// (either ConfigA or ConfigB, never partially applied)
+			if _, ok := cfg.Routers["r1"]; !ok {
+				invalidResponses <- "Config missing expected router"
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(stopChan)
+	wg.Wait()
+	close(invalidResponses)
+
+	for v := range invalidResponses {
+		t.Error(v)
+	}
+}
+
+func TestRaceDetector(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s.Start(ctx)
+
+	// Rapid concurrent config updates to trigger any data races
+	configs := []Configuration{
+		{
+			Routers:     map[string]RouterConfig{"r1": {Path: "/a", Middleware: "m1", ResponseText: "A"}},
+			Middlewares: map[string]MiddlewareConfig{"m1": {HeaderName: "X-A", HeaderValue: "a"}},
+		},
+		{
+			Routers:     map[string]RouterConfig{"r1": {Path: "/a", Middleware: "m2", ResponseText: "B"}},
+			Middlewares: map[string]MiddlewareConfig{"m2": {HeaderName: "X-B", HeaderValue: "b"}},
+		},
+		{
+			Routers:     map[string]RouterConfig{"r1": {Path: "/a", ResponseText: "C"}},
+			Middlewares: map[string]MiddlewareConfig{},
+		},
+	}
+
+	var wg sync.WaitGroup
+
+	// Writers
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				s.GetConfigurationChan() <- configs[idx%len(configs)]
+				time.Sleep(time.Microsecond)
+			}
+		}(i)
+	}
+
+	// Readers
+	ep := s.GetEntryPoint("web")
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				req := httptest.NewRequest(http.MethodGet, "/a", nil)
+				rec := httptest.NewRecorder()
+				ep.ServeHTTP(rec, req)
+				_ = s.GetConfig()
+				time.Sleep(time.Microsecond)
+			}
+		}()
+	}
+
+	wg.Wait()
+	cancel()
 }

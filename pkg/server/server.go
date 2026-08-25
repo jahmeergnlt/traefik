@@ -55,10 +55,11 @@ func NewServer() *Server {
 			"web": {},
 		},
 	}
-	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	// Initialize with a default handler.
+	// Must be *http.ServeMux to satisfy atomic.Value's same-type requirement,
+	// since switchConfigs always stores *http.ServeMux.
+	defaultMux := http.NewServeMux()
+	s.entryPoints["web"].handler.Store(defaultMux)
 	return s
 }
 
@@ -85,9 +86,10 @@ func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
-
-	// Rebuild the entrypoint handler atomically as a single, immutable unit.
+	// Build the new handler BEFORE updating any shared state.
+	// This ensures that at any point in time, the active handler
+	// is always consistent with the active configuration — either
+	// fully old or fully new, never a mix.
 	mux := http.NewServeMux()
 
 	for _, routerCfg := range config.Routers {
@@ -107,8 +109,11 @@ func (s *Server) switchConfigs(config Configuration) {
 		mux.Handle(cfg.Path, handler)
 	}
 
-	// Swap the active entrypoint handler atomically
+	// Swap the active entrypoint handler first, then update currentConfig.
+	// This eliminates the inconsistency window where GetConfig() returns
+	// the new config but ServeHTTP still uses the old handler chain.
 	s.entryPoints["web"].handler.Store(mux)
+	s.currentConfig = config
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
@@ -127,5 +132,22 @@ func (s *Server) GetEntryPoint(name string) *EntryPoint {
 func (s *Server) GetConfig() Configuration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.currentConfig
+	// Return a deep copy to prevent callers from mutating the live config
+	// through the shared map references.
+	cfg := s.currentConfig
+	if cfg.Routers != nil {
+		routers := make(map[string]RouterConfig, len(cfg.Routers))
+		for k, v := range cfg.Routers {
+			routers[k] = v
+		}
+		cfg.Routers = routers
+	}
+	if cfg.Middlewares != nil {
+		mws := make(map[string]MiddlewareConfig, len(cfg.Middlewares))
+		for k, v := range cfg.Middlewares {
+			mws[k] = v
+		}
+		cfg.Middlewares = mws
+	}
+	return cfg
 }
