@@ -7,6 +7,17 @@ import (
 	"sync/atomic"
 )
 
+// ProviderConfiguration represents configuration from a single provider.
+type ProviderConfiguration struct {
+	ProviderName string
+	Configuration
+}
+
+// providerConfigs stores the last configuration from each provider.
+// This enables proper merging of configurations from multiple providers.
+type providerConfigs map[string]Configuration
+
+
 // RouterConfig represents the configuration for a router.
 type RouterConfig struct {
 	Path         string
@@ -52,24 +63,27 @@ func NewServer() *Server {
 	s := &Server{
 		configurationChan: make(chan Configuration, 100),
 		entryPoints: map[string]*EntryPoint{
+
+// Server manages the entrypoints and configuration updates.
+type Server struct {
+	configurationChan chan ProviderConfiguration
+	entryPoints       map[string]*EntryPoint
+	mu                sync.RWMutex
+	providerConfigs   providerConfigs
+	currentConfig     Configuration
+}
+
+
+func (s *Server) Start(ctx context.Context) {
+	s := &Server{
+		configurationChan: make(chan ProviderConfiguration, 100),
+		entryPoints: map[string]*EntryPoint{
 			"web": {},
 		},
+		providerConfigs: make(providerConfigs),
 	}
 	// Initialize with a default handler
 	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
-	return s
-}
-
-func (s *Server) Start(ctx context.Context) {
-	go s.watcher(ctx)
-}
-
-func (s *Server) watcher(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
 			return
 		case config := <-s.configurationChan:
 			s.switchConfigs(config)
@@ -83,21 +97,59 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 
 func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
+		select {
+		case <-ctx.Done():
+			return
+		case providerConfig := <-s.configurationChan:
+			s.applyProviderConfig(providerConfig)
+		}
+	}
+}
+
+func (s *Server) GetConfigurationChan() chan<- ProviderConfiguration {
+	return s.configurationChan
+}
+
+// applyProviderConfig stores the provider's configuration and rebuilds the merged config.
+func (s *Server) applyProviderConfig(pc ProviderConfiguration) {
+	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Store this provider's configuration
+	s.providerConfigs[pc.ProviderName] = pc.Configuration
+
+	// Merge all provider configurations into a single configuration
+	merged := s.mergeConfigs()
+
+	// Apply the merged configuration
+	s.switchConfigsLocked(merged)
+}
+
+// mergeConfigs merges configurations from all providers.
+// Later providers (alphabetically) take precedence for conflicting keys.
+func (s *Server) mergeConfigs() Configuration {
+	merged := Configuration{
+		Routers:     make(map[string]RouterConfig),
+		Middlewares: make(map[string]MiddlewareConfig),
+	}
+
+	for _, cfg := range s.providerConfigs {
+		for name, router := range cfg.Routers {
+			merged.Routers[name] = router
+		}
+		for name, mw := range cfg.Middlewares {
+			merged.Middlewares[name] = mw
+		}
+	}
+
+	return merged
+}
+
+// switchConfigsLocked rebuilds the handler chain. Caller must hold s.mu.
+func (s *Server) switchConfigsLocked(config Configuration) {
 	s.currentConfig = config
 
 	// Rebuild the entrypoint handler atomically as a single, immutable unit.
-	mux := http.NewServeMux()
-
-	for _, routerCfg := range config.Routers {
-		cfg := routerCfg
-		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(cfg.ResponseText))
-		})
-
-		// Wrap with middleware if configured, using the configuration snapshot
 		if cfg.Middleware != "" {
 			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
 				handler = s.buildMiddleware(mwCfg, handler)

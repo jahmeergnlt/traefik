@@ -15,13 +15,13 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	defer cancel()
 
 	s.Start(ctx)
+	s.Start(ctx)
 
 	// Initial configuration: route1 uses mw1 (Old)
-	initialConfig := Configuration{
+	initialConfig := ProviderConfiguration{ProviderName: "initial", Configuration: Configuration{
 		Routers: map[string]RouterConfig{
 			"route1": {
 				Path:         "/test",
-				Middleware:   "mw1",
 				ResponseText: "Old Router",
 			},
 		},
@@ -31,7 +31,7 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 				HeaderValue: "Old",
 			},
 		},
-	}
+	}}
 	s.GetConfigurationChan() <- initialConfig
 	time.Sleep(50 * time.Millisecond)
 
@@ -42,13 +42,14 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for {
 			select {
 			case <-stopChan:
 				return
 			default:
-				configA := Configuration{
+				configA := ProviderConfiguration{ProviderName: "providerA", Configuration: Configuration{
 					Routers: map[string]RouterConfig{
+						"route1": {
+							Path:         "/test",
 						"route1": {
 							Path:         "/test",
 							Middleware:   "mw2",
@@ -59,13 +60,13 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 						"mw1": {
 							HeaderName:  "X-Test-Header",
 							HeaderValue: "Old",
-						},
-						"mw2": {
-							HeaderName:  "X-Test-Header",
 							HeaderValue: "New",
 						},
 					},
-				}
+				}}
+				s.GetConfigurationChan() <- configA
+				time.Sleep(2 * time.Millisecond)
+			}
 				s.GetConfigurationChan() <- configA
 				time.Sleep(2 * time.Millisecond)
 			}
@@ -73,13 +74,14 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	}()
 
 	// Provider B: updates an unrelated router, but keeps route1 using mw1 (Old)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
 			select {
 			case <-stopChan:
 				return
+			default:
+				configB := ProviderConfiguration{ProviderName: "providerB", Configuration: Configuration{
+					Routers: map[string]RouterConfig{
+						"route1": {
+							Path:         "/test",
 			default:
 				configB := Configuration{
 					Routers: map[string]RouterConfig{
@@ -90,13 +92,13 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 						},
 						"unrelated": {
 							Path:         "/unrelated",
-							Middleware:   "",
-							ResponseText: "Unrelated Router",
+							HeaderValue: "Old",
 						},
 					},
-					Middlewares: map[string]MiddlewareConfig{
-						"mw1": {
-							HeaderName:  "X-Test-Header",
+				}}
+				s.GetConfigurationChan() <- configB
+				time.Sleep(2 * time.Millisecond)
+			}
 							HeaderValue: "Old",
 						},
 					},
