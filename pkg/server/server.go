@@ -26,26 +26,68 @@ type Configuration struct {
 	Middlewares map[string]MiddlewareConfig
 }
 
+// cloneConfiguration returns a deep copy of c so that neither the provider
+// that sent it nor a caller inspecting it through GetConfig can mutate the
+// live state afterwards.
+func cloneConfiguration(c Configuration) Configuration {
+	out := Configuration{
+		Routers:     make(map[string]RouterConfig, len(c.Routers)),
+		Middlewares: make(map[string]MiddlewareConfig, len(c.Middlewares)),
+	}
+	for name, cfg := range c.Routers {
+		out.Routers[name] = cfg
+	}
+	for name, cfg := range c.Middlewares {
+		out.Middlewares[name] = cfg
+	}
+	return out
+}
+
+// entryPointState is the immutable active state of an entrypoint: the
+// configuration snapshot that produced it together with the fully built
+// handler chain (router + middlewares) for that exact snapshot.
+//
+// Both fields are published behind a single pointer so readers can never
+// observe the new configuration together with a stale handler chain, or
+// vice versa — the transition is indivisible.
+type entryPointState struct {
+	config  Configuration
+	handler http.Handler
+}
+
 // EntryPoint represents an entrypoint.
 type EntryPoint struct {
-	handler atomic.Value // holds http.Handler
+	state atomic.Pointer[entryPointState]
 }
 
 func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h := e.handler.Load()
-	if h != nil {
-		h.(http.Handler).ServeHTTP(w, r)
-	} else {
-		http.Error(w, "Not Found", http.StatusNotFound)
+	st := e.state.Load()
+	if st != nil && st.handler != nil {
+		st.handler.ServeHTTP(w, r)
+		return
 	}
+	http.Error(w, "Not Found", http.StatusNotFound)
+}
+
+// config returns a copy of the configuration snapshot that produced the
+// currently active handler chain.
+func (e *EntryPoint) config() Configuration {
+	st := e.state.Load()
+	if st == nil {
+		return Configuration{}
+	}
+	return cloneConfiguration(st.config)
 }
 
 // Server manages the entrypoints and configuration updates.
 type Server struct {
 	configurationChan chan Configuration
 	entryPoints       map[string]*EntryPoint
-	mu                sync.RWMutex
-	currentConfig     Configuration
+
+	// mu serializes configuration merges/rebuilds so that updates applied
+	// through switchConfigs can never interleave and publish a partially
+	// applied state.
+	mu sync.Mutex
 }
 
 func NewServer() *Server {
@@ -56,9 +98,12 @@ func NewServer() *Server {
 		},
 	}
 	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	s.entryPoints["web"].state.Store(&entryPointState{
+		config: Configuration{},
+		handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Not Found", http.StatusNotFound)
+		}),
+	})
 	return s
 }
 
@@ -85,9 +130,15 @@ func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
+	// Take private ownership of the incoming configuration first: providers
+	// may reuse or mutate their maps after sending, and the merged state must
+	// never be corrupted by that.
+	config = cloneConfiguration(config)
 
-	// Rebuild the entrypoint handler atomically as a single, immutable unit.
+	// Rebuild the entire entrypoint handler — router plus the resolved
+	// middleware chain — as a single immutable unit before anything is
+	// published. Until the swap below, in-flight requests keep using the
+	// previous complete chain.
 	mux := http.NewServeMux()
 
 	for _, routerCfg := range config.Routers {
@@ -107,8 +158,13 @@ func (s *Server) switchConfigs(config Configuration) {
 		mux.Handle(cfg.Path, handler)
 	}
 
-	// Swap the active entrypoint handler atomically
-	s.entryPoints["web"].handler.Store(mux)
+	// Publish the configuration and its handler chain together in one atomic
+	// store. There is no window in which the API/Dashboard can report the new
+	// configuration while requests still execute a stale middleware chain.
+	s.entryPoints["web"].state.Store(&entryPointState{
+		config:  config,
+		handler: mux,
+	})
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
@@ -119,13 +175,12 @@ func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.H
 }
 
 func (s *Server) GetEntryPoint(name string) *EntryPoint {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return s.entryPoints[name]
 }
 
+// GetConfig returns a copy of the configuration snapshot that produced the
+// currently active handler chain. The returned maps are private to the
+// caller.
 func (s *Server) GetConfig() Configuration {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.currentConfig
+	return s.entryPoints["web"].config()
 }
