@@ -5,10 +5,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// TestConcurrentConfigurationUpdates is the original report's reproduction.
+// Before the fix it panicked with
+// "sync/atomic: store of inconsistently typed value into Value" on the first
+// configuration update, because NewServer stored an http.HandlerFunc and the
+// watcher stored an *http.ServeMux into the same atomic.Value.
 func TestConcurrentConfigurationUpdates(t *testing.T) {
 	s := NewServer()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -141,4 +147,121 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	close(stopChan)
 	wg.Wait()
+}
+
+// TestEntryPointStoresConsistentType guards the specific defect that crashed
+// the process: NewServer publishes an http.HandlerFunc and switchConfigs
+// publishes an *http.ServeMux. An atomic.Value panics when two different
+// concrete types are stored, so this asserts the first update does not panic.
+func TestEntryPointStoresConsistentType(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	// This store used to panic because the initial handler was a
+	// http.HandlerFunc and this one is a *http.ServeMux.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("switchConfigs panicked on a configuration update: %v", r)
+		}
+	}()
+
+	s.GetConfigurationChan() <- Configuration{
+		Routers: map[string]RouterConfig{
+			"r": {Path: "/a", ResponseText: "a"},
+		},
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	rec := httptest.NewRecorder()
+	s.GetEntryPoint("web").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/a", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "a" {
+		t.Fatalf("after first update got code=%d body=%q, want 200 and %q", rec.Code, rec.Body.String(), "a")
+	}
+}
+
+// TestRouterAndMiddlewareAlwaysConsistent asserts the property the issue asks
+// for: whatever configuration is active, the handler chain that serves a
+// request was built from that same configuration. It drives concurrent updates
+// where the response body and the middleware header are changed together, so a
+// partially applied configuration shows up as a body/header mismatch.
+func TestRouterAndMiddlewareAlwaysConsistent(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	// Two configurations that must always travel together.
+	oldCfg := Configuration{
+		Routers:     map[string]RouterConfig{"r": {Path: "/x", Middleware: "m", ResponseText: "old"}},
+		Middlewares: map[string]MiddlewareConfig{"m": {HeaderName: "X-Gen", HeaderValue: "old"}},
+	}
+	newCfg := Configuration{
+		Routers:     map[string]RouterConfig{"r": {Path: "/x", Middleware: "m", ResponseText: "new"}},
+		Middlewares: map[string]MiddlewareConfig{"m": {HeaderName: "X-Gen", HeaderValue: "new"}},
+	}
+
+	s.GetConfigurationChan() <- oldCfg
+	time.Sleep(50 * time.Millisecond)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var mismatches int64
+	var requests int64
+
+	// Writers: flip between the two configurations as fast as possible.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					if id%2 == 0 {
+						s.GetConfigurationChan() <- newCfg
+					} else {
+						s.GetConfigurationChan() <- oldCfg
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Readers: every response must have a body and header from the same config.
+	ep := s.GetEntryPoint("web")
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					rec := httptest.NewRecorder()
+					ep.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+					atomic.AddInt64(&requests, 1)
+					body := rec.Body.String()
+					gen := rec.Header().Get("X-Gen")
+					if body != gen {
+						atomic.AddInt64(&mismatches, 1)
+					}
+				}
+			}
+		}()
+	}
+
+	time.Sleep(700 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	if n := atomic.LoadInt64(&requests); n == 0 {
+		t.Fatal("no requests were served")
+	}
+	if n := atomic.LoadInt64(&mismatches); n != 0 {
+		t.Fatalf("%d requests observed a partially applied configuration (body and middleware from different configs)", n)
+	}
 }
