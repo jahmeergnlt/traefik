@@ -265,3 +265,147 @@ func TestRouterAndMiddlewareAlwaysConsistent(t *testing.T) {
 		t.Fatalf("%d requests observed a partially applied configuration (body and middleware from different configs)", n)
 	}
 }
+
+// TestGetConfigMatchesServingHandler covers the ordering window.
+//
+// switchConfigs used to assign currentConfig before building and publishing the
+// new handler, so GetConfig could report the new configuration while ServeHTTP
+// was still routing through the previous chain.
+//
+// The guarantee is that the reported configuration and the serving handler are
+// published as one value, so they cannot disagree. This asserts it the only way
+// it can be asserted without a time-of-check race in the test itself: the
+// published pair is loaded once and its two halves must match.
+func TestGetConfigMatchesServingHandler(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	oldCfg := Configuration{
+		Routers:     map[string]RouterConfig{"r": {Path: "/x", Middleware: "m", ResponseText: "old"}},
+		Middlewares: map[string]MiddlewareConfig{"m": {HeaderName: "X-Gen", HeaderValue: "old"}},
+	}
+	newCfg := Configuration{
+		Routers:     map[string]RouterConfig{"r": {Path: "/x", Middleware: "m", ResponseText: "new"}},
+		Middlewares: map[string]MiddlewareConfig{"m": {HeaderName: "X-Gen", HeaderValue: "new"}},
+	}
+
+	s.GetConfigurationChan() <- oldCfg
+	time.Sleep(50 * time.Millisecond)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var mismatches int64
+	var checks int64
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				s.GetConfigurationChan() <- newCfg
+				s.GetConfigurationChan() <- oldCfg
+			}
+		}
+	}()
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ep := s.GetEntryPoint("web")
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					// One atomic load of the published pair.
+					st := ep.load()
+					reported := st.config.Routers["r"].ResponseText
+
+					rec := httptest.NewRecorder()
+					st.handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+					served := rec.Body.String()
+
+					atomic.AddInt64(&checks, 1)
+					if reported != served {
+						atomic.AddInt64(&mismatches, 1)
+					}
+				}
+			}
+		}()
+	}
+
+	time.Sleep(600 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	if atomic.LoadInt64(&checks) == 0 {
+		t.Fatal("no checks ran")
+	}
+	if n := atomic.LoadInt64(&mismatches); n != 0 {
+		t.Fatalf("published configuration and handler disagreed %d times", n)
+	}
+}
+
+// TestProviderMutationDoesNotAffectLiveConfig covers map aliasing: the provider
+// keeps the maps it sent, and mutating them afterwards must not rewrite live
+// routing state.
+func TestProviderMutationDoesNotAffectLiveConfig(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	routers := map[string]RouterConfig{
+		"r": {Path: "/x", Middleware: "m", ResponseText: "original"},
+	}
+	middlewares := map[string]MiddlewareConfig{
+		"m": {HeaderName: "X-Gen", HeaderValue: "original"},
+	}
+	s.GetConfigurationChan() <- Configuration{Routers: routers, Middlewares: middlewares}
+	time.Sleep(80 * time.Millisecond)
+
+	// The provider reuses its maps, as a caching provider would.
+	routers["r"] = RouterConfig{Path: "/x", Middleware: "m", ResponseText: "mutated"}
+	middlewares["m"] = MiddlewareConfig{HeaderName: "X-Gen", HeaderValue: "mutated"}
+	delete(routers, "r")
+
+	rec := httptest.NewRecorder()
+	s.GetEntryPoint("web").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Body.String() != "original" {
+		t.Fatalf("provider mutation changed live routing: body=%q, want %q", rec.Body.String(), "original")
+	}
+	if got := rec.Header().Get("X-Gen"); got != "original" {
+		t.Fatalf("provider mutation changed live middleware: header=%q, want %q", got, "original")
+	}
+}
+
+// TestGetConfigIsNotAliasedToProviderMaps covers the other half of map
+// aliasing: a caller mutating the value returned by GetConfig must not be able
+// to change what is serving.
+func TestGetConfigIsNotAliasedToProviderMaps(t *testing.T) {
+	s := NewServer()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	s.GetConfigurationChan() <- Configuration{
+		Routers:     map[string]RouterConfig{"r": {Path: "/x", ResponseText: "original"}},
+		Middlewares: map[string]MiddlewareConfig{},
+	}
+	time.Sleep(80 * time.Millisecond)
+
+	got := s.GetConfig()
+	got.Routers["r"] = RouterConfig{Path: "/x", ResponseText: "tampered"}
+
+	rec := httptest.NewRecorder()
+	s.GetEntryPoint("web").ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rec.Body.String() != "original" {
+		t.Fatalf("mutating GetConfig result changed live routing: body=%q", rec.Body.String())
+	}
+}

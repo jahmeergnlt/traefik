@@ -26,46 +26,79 @@ type Configuration struct {
 	Middlewares map[string]MiddlewareConfig
 }
 
-// EntryPoint represents an entrypoint.
+// clone returns a deep copy of the configuration.
 //
-// handler holds exactly one concrete type, handlerHolder, so that repeated
-// stores into the atomic.Value never mix types. An atomic.Value panics if a
-// second, different concrete type is stored into it, and previously the
-// watcher stored a bare *http.ServeMux while NewServer stored an
-// http.HandlerFunc, which crashed the process on the first configuration
-// update.
-type EntryPoint struct {
-	handler atomic.Value // holds handlerHolder
+// The maps handed to switchConfigs belong to whichever provider produced them.
+// Keeping references to them would mean a provider that reuses or mutates a map
+// after sending it silently rewrites live routing state, and a caller that
+// mutates the value returned by GetConfig would do the same. The clone is what
+// makes the published configuration immutable in practice, not just by
+// convention.
+func (c Configuration) clone() Configuration {
+	out := Configuration{
+		Routers:     make(map[string]RouterConfig, len(c.Routers)),
+		Middlewares: make(map[string]MiddlewareConfig, len(c.Middlewares)),
+	}
+	for k, v := range c.Routers {
+		out.Routers[k] = v
+	}
+	for k, v := range c.Middlewares {
+		out.Middlewares[k] = v
+	}
+	return out
 }
 
-// handlerHolder wraps a handler so every store has the same concrete type.
-type handlerHolder struct {
+// entryPointState is the immutable pair that an entrypoint serves from.
+//
+// Config and handler travel together because they are only meaningful
+// together: GetConfig reports what the API and Dashboard show, and handler is
+// what actually serves the request. Publishing them as one value means a
+// reader can never see the new router configuration while requests still go
+// through the previous middleware chain, or the reverse.
+//
+// The field is also a single concrete type, which is what keeps repeated stores
+// into the atomic.Value legal: an atomic.Value panics when a second, different
+// concrete type is stored into it, and previously the watcher stored an
+// *http.ServeMux while NewServer had stored an http.HandlerFunc.
+type entryPointState struct {
+	config  Configuration
 	handler http.Handler
 }
 
-func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	holder := e.handler.Load()
-	if holder == nil {
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
-	h, ok := holder.(handlerHolder)
-	if !ok || h.handler == nil {
-		http.Error(w, "Not Found", http.StatusNotFound)
-		return
-	}
-	h.handler.ServeHTTP(w, r)
+// EntryPoint represents an entrypoint.
+type EntryPoint struct {
+	state atomic.Value // holds entryPointState
 }
 
-// store publishes a handler atomically. A nil handler is replaced by a
-// not-found handler so the entrypoint never panics on a request.
-func (e *EntryPoint) store(h http.Handler) {
-	if h == nil {
-		h = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.Error(w, "Not Found", http.StatusNotFound)
-		})
+func notFoundHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "Not Found", http.StatusNotFound)
+	})
+}
+
+func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	st := e.load()
+	st.handler.ServeHTTP(w, r)
+}
+
+func (e *EntryPoint) load() entryPointState {
+	loaded := e.state.Load()
+	if loaded == nil {
+		return entryPointState{handler: notFoundHandler()}
 	}
-	e.handler.Store(handlerHolder{handler: h})
+	st, ok := loaded.(entryPointState)
+	if !ok || st.handler == nil {
+		return entryPointState{handler: notFoundHandler()}
+	}
+	return st
+}
+
+// store publishes a configuration and its handler as one indivisible value.
+func (e *EntryPoint) store(config Configuration, handler http.Handler) {
+	if handler == nil {
+		handler = notFoundHandler()
+	}
+	e.state.Store(entryPointState{config: config, handler: handler})
 }
 
 // Server manages the entrypoints and configuration updates.
@@ -83,10 +116,8 @@ func NewServer() *Server {
 			"web": {},
 		},
 	}
-	// Initialize with a default handler
-	s.entryPoints["web"].store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	// Initialize with a default handler and an empty configuration.
+	s.entryPoints["web"].store(Configuration{}, notFoundHandler())
 	return s
 }
 
@@ -113,30 +144,34 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 	return s.configurationChan
 }
 
-// switchConfigs builds the complete handler set for config and publishes it as
-// one immutable unit. The router tree and every middleware chain it references
-// are constructed from the same config value before anything becomes visible,
-// so a request can never observe a router from one configuration and a
-// middleware from another.
+// switchConfigs builds the complete handler set for config and publishes it,
+// together with the configuration itself, as one immutable unit.
+//
+// Nothing becomes observable until the final store: the routing tree and every
+// middleware chain it references are built from the same snapshot first, so a
+// request can never observe a router from one configuration and a middleware
+// from another, and GetConfig can never report a configuration that is not yet
+// serving. The configuration is cloned on the way in, so a provider that
+// mutates a map after sending it cannot corrupt live state.
 func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
+	snapshot := config.clone()
 
-	// Build the new routing tree completely before publishing it.
+	// Build the new routing tree completely before publishing anything.
 	mux := http.NewServeMux()
 
-	for _, routerCfg := range config.Routers {
+	for _, routerCfg := range snapshot.Routers {
 		cfg := routerCfg
 		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(cfg.ResponseText))
 		})
 
-		// Wrap with middleware if configured, using the configuration snapshot
+		// Wrap with middleware if configured, using the same snapshot.
 		if cfg.Middleware != "" {
-			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
+			if mwCfg, ok := snapshot.Middlewares[cfg.Middleware]; ok {
 				handler = s.buildMiddleware(mwCfg, handler)
 			}
 		}
@@ -144,9 +179,10 @@ func (s *Server) switchConfigs(config Configuration) {
 		mux.Handle(cfg.Path, handler)
 	}
 
-	// Swap the active entrypoint handler atomically. This is the only point at
-	// which the new configuration becomes observable, and it is a single store.
-	s.entryPoints["web"].store(mux)
+	s.currentConfig = snapshot
+
+	// Single publish point: configuration and handler become visible together.
+	s.entryPoints["web"].store(snapshot, mux)
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
@@ -162,8 +198,15 @@ func (s *Server) GetEntryPoint(name string) *EntryPoint {
 	return s.entryPoints[name]
 }
 
+// GetConfig returns the configuration that is currently serving requests.
+//
+// The returned value is read from the same immutable pair that ServeHTTP uses,
+// and it is a clone, so a caller cannot mutate live state through it.
 func (s *Server) GetConfig() Configuration {
+	if ep := s.GetEntryPoint("web"); ep != nil {
+		return ep.load().config.clone()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.currentConfig
+	return s.currentConfig.clone()
 }
