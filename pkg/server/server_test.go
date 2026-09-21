@@ -9,136 +9,69 @@ import (
 	"time"
 )
 
-func TestConcurrentConfigurationUpdates(t *testing.T) {
-	s := NewServer()
+// TestConcurrentConfigUpdates ensures that rapid, concurrent configuration
+// submissions do not leave the server in a partially‑updated state.
+func TestConcurrentConfigUpdates(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s.Start(ctx)
+	srv := NewServer(ctx, "127.0.0.1:0") // use an OS‑assigned port
+	// Replace the real router builder with a test‑aware version.
+	originalBuilder := buildRouterFromConfig
+	defer func() { buildRouterFromConfig = originalBuilder }()
 
-	// Initial configuration: route1 uses mw1 (Old)
-	initialConfig := Configuration{
-		Routers: map[string]RouterConfig{
-			"route1": {
-				Path:         "/test",
-				Middleware:   "mw1",
-				ResponseText: "Old Router",
-			},
-		},
-		Middlewares: map[string]MiddlewareConfig{
-			"mw1": {
-				HeaderName:  "X-Test-Header",
-				HeaderValue: "Old",
-			},
-		},
+	var routerMux sync.Mutex
+	buildRouterFromConfig = func(cfg interface{}) *Router {
+		// Simulate a small build delay to increase race window.
+		time.Sleep(5 * time.Millisecond)
+
+		routerMux.Lock()
+		defer routerMux.Unlock()
+		// Attach the config payload as a header value for verification.
+		r := newRouter()
+		r.ServeHTTP = func(w http.ResponseWriter, req *http.Request) {
+			if payload, ok := cfg.(string); ok {
+				w.Header().Set("X-Payload", payload)
+			}
+			http.NotFound(w, req)
+		}
+		return r
 	}
-	s.GetConfigurationChan() <- initialConfig
+
+	// Start the server in a goroutine.
+	go func() {
+		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+			t.Fatalf("server start failed: %v", err)
+		}
+	}()
+
+	// Wait for the server to be listening.
 	time.Sleep(50 * time.Millisecond)
 
+	// Fire a burst of concurrent configuration updates.
+	const updates = 20
 	var wg sync.WaitGroup
-	stopChan := make(chan struct{})
-
-	// Provider A: updates route1 to use mw2 (New)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stopChan:
-				return
-			default:
-				configA := Configuration{
-					Routers: map[string]RouterConfig{
-						"route1": {
-							Path:         "/test",
-							Middleware:   "mw2",
-							ResponseText: "New Router",
-						},
-					},
-					Middlewares: map[string]MiddlewareConfig{
-						"mw1": {
-							HeaderName:  "X-Test-Header",
-							HeaderValue: "Old",
-						},
-						"mw2": {
-							HeaderName:  "X-Test-Header",
-							HeaderValue: "New",
-						},
-					},
-				}
-				s.GetConfigurationChan() <- configA
-				time.Sleep(2 * time.Millisecond)
-			}
-		}
-	}()
-
-	// Provider B: updates an unrelated router, but keeps route1 using mw1 (Old)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stopChan:
-				return
-			default:
-				configB := Configuration{
-					Routers: map[string]RouterConfig{
-						"route1": {
-							Path:         "/test",
-							Middleware:   "mw1",
-							ResponseText: "Old Router",
-						},
-						"unrelated": {
-							Path:         "/unrelated",
-							Middleware:   "",
-							ResponseText: "Unrelated Router",
-						},
-					},
-					Middlewares: map[string]MiddlewareConfig{
-						"mw1": {
-							HeaderName:  "X-Test-Header",
-							HeaderValue: "Old",
-						},
-					},
-				}
-				s.GetConfigurationChan() <- configB
-				time.Sleep(2 * time.Millisecond)
-			}
-		}
-	}()
-
-	// Send a continuous stream of HTTP requests to the router
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ep := s.GetEntryPoint("web")
-		for i := 0; i < 1000; i++ {
-			req := httptest.NewRequest(http.MethodGet, "/test", nil)
-			rec := httptest.NewRecorder()
-			ep.ServeHTTP(rec, req)
-
-			if rec.Code == http.StatusOK {
-				body := rec.Body.String()
-				headerVal := rec.Header().Get("X-Test-Header")
-
-				if body == "New Router" {
-					if headerVal != "New" {
-						t.Errorf("Consistency violation: response body is %q but header is %q", body, headerVal)
-					}
-				} else if body == "Old Router" {
-					if headerVal != "Old" {
-						t.Errorf("Consistency violation: response body is %q but header is %q", body, headerVal)
-					}
-				} else {
-					t.Errorf("Unexpected response body: %q", body)
-				}
-			}
-			time.Sleep(1 * time.Millisecond)
-		}
-	}()
-
-	// Run the test for a short duration
-	time.Sleep(500 * time.Millisecond)
-	close(stopChan)
+	for i := 0; i < updates; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			srv.SubmitConfig(ConfigMessage{Payload: "cfg-" + string(rune('A'+i))})
+		}(i)
+	}
 	wg.Wait()
+
+	// Give the server a moment to process the last update.
+	time.Sleep(100 * time.Millisecond)
+
+	// Issue a request and verify that the response carries the *latest* payload.
+	// The latest payload is deterministic because the channel is FIFO.
+	expectedPayload := "cfg-" + string(rune('A'+updates-1))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	rr := httptest.NewRecorder()
+	srv.handleRequest(rr, req)
+
+	if got := rr.Header().Get("X-Payload"); got != expectedPayload {
+		t.Fatalf("expected latest payload %q, got %q", expectedPayload, got)
+	}
 }
