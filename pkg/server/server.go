@@ -107,8 +107,9 @@ func (s *Server) switchConfigs(config Configuration) {
 		mux.Handle(cfg.Path, handler)
 	}
 
-	// Swap the active entrypoint handler atomically
-	s.entryPoints["web"].handler.Store(mux)
+	// Swap the active entrypoint handler atomically. Store the same concrete
+	// type as NewServer to satisfy atomic.Value's type consistency requirement.
+	s.entryPoints["web"].handler.Store(http.HandlerFunc(mux.ServeHTTP))
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
