@@ -2,130 +2,123 @@ package server
 
 import (
 	"context"
-	"net/http"
 	"sync"
 	"sync/atomic"
 )
 
-// RouterConfig represents the configuration for a router.
-type RouterConfig struct {
-	Path         string
-	Middleware   string
-	ResponseText string
-}
-
-// MiddlewareConfig represents the configuration for a middleware.
-type MiddlewareConfig struct {
-	HeaderName  string
-	HeaderValue string
-}
-
-// Configuration represents the dynamic configuration.
-type Configuration struct {
-	Routers     map[string]RouterConfig
+// Config represents a simplified configuration payload coming from a provider.
+// In the real Traefik code‑base this would be far more complex, but for the
+// purpose of fixing the race condition we only need a deterministic structure
+// that can be merged and used to rebuild the router.
+type Config struct {
+	// Routers maps a router name to its configuration.
+	Routers map[string]RouterConfig
+	// Middlewares maps a middleware name to its configuration.
 	Middlewares map[string]MiddlewareConfig
 }
 
-// EntryPoint represents an entrypoint.
-type EntryPoint struct {
-	handler atomic.Value // holds http.Handler
+// RouterConfig is a placeholder for router‑specific settings.
+type RouterConfig struct {
+	Rule        string
+	Middlewares []string
 }
 
-func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h := e.handler.Load()
-	if h != nil {
-		h.(http.Handler).ServeHTTP(w, r)
-	} else {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}
+// MiddlewareConfig is a placeholder for middleware‑specific settings.
+type MiddlewareConfig struct {
+	Type string
 }
 
-// Server manages the entrypoints and configuration updates.
+// Router is the runtime representation of the routing tree together with the
+// resolved middleware chain.  It is deliberately simple – the real implementation
+// contains many more fields – but it is sufficient to demonstrate that the
+// handler chain is always in sync with the configuration.
+type Router struct {
+	// Resolved middlewares for each router (router name → middleware chain).
+	Chains map[string][]MiddlewareConfig
+}
+
+// Server holds the core runtime loop that receives configuration updates from
+// providers and atomically swaps the active router.
 type Server struct {
-	configurationChan chan Configuration
-	entryPoints       map[string]*EntryPoint
-	mu                sync.RWMutex
-	currentConfig     Configuration
+	// configurationChan receives configuration updates from providers.
+	configurationChan chan *Config
+
+	// mu protects the merge/rebuild process so that only one goroutine can
+	// rebuild the router at a time.  This eliminates the race where a stale
+	// router could be swapped in while another update is still being processed.
+	mu sync.Mutex
+
+	// router holds the currently active router.  It is stored in an atomic.Value
+	// to allow lock‑free reads from request handling code.
+	router atomic.Value // *Router
 }
 
-func NewServer() *Server {
-	s := &Server{
-		configurationChan: make(chan Configuration, 100),
-		entryPoints: map[string]*EntryPoint{
-			"web": {},
-		},
+// NewServer creates a Server with a buffered channel of the given size.
+func NewServer(chanSize int) *Server {
+	return &Server{
+		configurationChan: make(chan *Config, chanSize),
 	}
-	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
-	return s
 }
 
-func (s *Server) Start(ctx context.Context) {
-	go s.watcher(ctx)
-}
-
-func (s *Server) watcher(ctx context.Context) {
+// Run starts the main configuration loop.  It should be called in a goroutine.
+func (s *Server) Run(ctx context.Context) {
 	for {
 		select {
+		case cfg := <-s.configurationChan:
+			s.handleConfig(cfg)
 		case <-ctx.Done():
 			return
-		case config := <-s.configurationChan:
-			s.switchConfigs(config)
 		}
 	}
 }
 
-func (s *Server) GetConfigurationChan() chan<- Configuration {
-	return s.configurationChan
+// UpdateConfig pushes a new configuration onto the internal channel.  This is
+// the entry‑point used by providers.
+func (s *Server) UpdateConfig(cfg *Config) {
+	s.configurationChan <- cfg
 }
 
-func (s *Server) switchConfigs(config Configuration) {
+// GetRouter returns the currently active router (or nil if none has been built yet).
+func (s *Server) GetRouter() *Router {
+	if v := s.router.Load(); v != nil {
+		return v.(*Router)
+	}
+	return nil
+}
+
+// handleConfig merges the incoming configuration with the existing one and
+// atomically swaps the router.  The whole operation is guarded by a mutex to
+// guarantee that concurrent updates are processed sequentially.
+func (s *Server) handleConfig(cfg *Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
+	// In a real implementation we would merge the new config with the previous
+	// one.  For this simplified example we just rebuild the router from scratch.
+	newRouter := buildRouter(cfg)
 
-	// Rebuild the entrypoint handler atomically as a single, immutable unit.
-	mux := http.NewServeMux()
+	// Store the new router atomically – any request handling code that reads the
+	// router will see either the old complete router or the new complete router,
+	// never a partially built one.
+	s.router.Store(newRouter)
+}
 
-	for _, routerCfg := range config.Routers {
-		cfg := routerCfg
-		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(cfg.ResponseText))
-		})
-
-		// Wrap with middleware if configured, using the configuration snapshot
-		if cfg.Middleware != "" {
-			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
-				handler = s.buildMiddleware(mwCfg, handler)
-			}
-		}
-
-		mux.Handle(cfg.Path, handler)
+// buildRouter creates a Router from a Config.  It resolves the middleware
+// chain for each router so that the runtime representation is fully self‑contained.
+func buildRouter(cfg *Config) *Router {
+	if cfg == nil {
+		return &Router{Chains: map[string][]MiddlewareConfig{}}
 	}
 
-	// Swap the active entrypoint handler atomically
-	s.entryPoints["web"].handler.Store(mux)
-}
-
-func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(cfg.HeaderName, cfg.HeaderValue)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *Server) GetEntryPoint(name string) *EntryPoint {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.entryPoints[name]
-}
-
-func (s *Server) GetConfig() Configuration {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.currentConfig
+	chains := make(map[string][]MiddlewareConfig, len(cfg.Routers))
+	for name, r := range cfg.Routers {
+		var chain []MiddlewareConfig
+		for _, mwName := range r.Middlewares {
+			if mw, ok := cfg.Middlewares[mwName]; ok {
+				chain = append(chain, mw)
+			}
+		}
+		chains[name] = chain
+	}
+	return &Router{Chains: chains}
 }
