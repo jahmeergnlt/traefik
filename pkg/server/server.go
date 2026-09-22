@@ -26,6 +26,12 @@ type Configuration struct {
 	Middlewares map[string]MiddlewareConfig
 }
 
+// ProviderConfig holds the configuration from a single provider.
+type ProviderConfig struct {
+	Routers     map[string]RouterConfig
+	Middlewares map[string]MiddlewareConfig
+}
+
 // EntryPoint represents an entrypoint.
 type EntryPoint struct {
 	handler atomic.Value // holds http.Handler
@@ -42,55 +48,102 @@ func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Server manages the entrypoints and configuration updates.
 type Server struct {
-	configurationChan chan Configuration
-	entryPoints       map[string]*EntryPoint
-	mu                sync.RWMutex
-	currentConfig     Configuration
+	providerConfigs map[string]*ProviderConfig
+	providerMu      sync.RWMutex
+	entryPoints     map[string]*EntryPoint
+	mu              sync.RWMutex
+	currentConfig   Configuration
+	configVersion   uint64
 }
 
 func NewServer() *Server {
 	s := &Server{
-		configurationChan: make(chan Configuration, 100),
+		providerConfigs: make(map[string]*ProviderConfig),
 		entryPoints: map[string]*EntryPoint{
 			"web": {},
 		},
 	}
-	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Initialize with a default handler (http.ServeMux implements http.Handler)
+	defaultMux := http.NewServeMux()
+	defaultMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	})
+	s.entryPoints["web"].handler.Store(defaultMux)
 	return s
 }
 
-func (s *Server) Start(ctx context.Context) {
-	go s.watcher(ctx)
-}
+// RegisterProvider registers a new configuration provider and returns a channel for sending updates.
+func (s *Server) RegisterProvider(providerID string) chan<- Configuration {
+	s.providerMu.Lock()
+	defer s.providerMu.Unlock()
 
-func (s *Server) watcher(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case config := <-s.configurationChan:
-			s.switchConfigs(config)
-		}
+	if existing, exists := s.providerConfigs[providerID]; exists {
+		// Return a channel that forwards to the existing provider's update logic
+		ch := make(chan Configuration, 100)
+		go func() {
+			for config := range ch {
+				s.updateProviderConfig(providerID, config)
+			}
+		}()
+		_ = existing // suppress unused warning
+		return ch
 	}
+
+	ch := make(chan Configuration, 100)
+	s.providerConfigs[providerID] = &ProviderConfig{
+		Routers:     make(map[string]RouterConfig),
+		Middlewares: make(map[string]MiddlewareConfig),
+	}
+
+	go func() {
+		for config := range ch {
+			s.updateProviderConfig(providerID, config)
+		}
+	}()
+
+	return ch
 }
 
-func (s *Server) GetConfigurationChan() chan<- Configuration {
-	return s.configurationChan
+func (s *Server) updateProviderConfig(providerID string, config Configuration) {
+	s.providerMu.Lock()
+	providerCfg, exists := s.providerConfigs[providerID]
+	if !exists {
+		s.providerMu.Unlock()
+		return
+	}
+	providerCfg.Routers = config.Routers
+	providerCfg.Middlewares = config.Middlewares
+	s.providerMu.Unlock()
+
+	s.mergeAndRebuild()
 }
 
-func (s *Server) switchConfigs(config Configuration) {
+func (s *Server) mergeAndRebuild() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
+	s.providerMu.RLock()
+	merged := Configuration{
+		Routers:     make(map[string]RouterConfig),
+		Middlewares: make(map[string]MiddlewareConfig),
+	}
+	for _, providerCfg := range s.providerConfigs {
+		for name, router := range providerCfg.Routers {
+			merged.Routers[name] = router
+		}
+		for name, mw := range providerCfg.Middlewares {
+			merged.Middlewares[name] = mw
+		}
+	}
+	s.providerMu.RUnlock()
+
+	s.currentConfig = merged
+	atomic.AddUint64(&s.configVersion, 1)
 
 	// Rebuild the entrypoint handler atomically as a single, immutable unit.
 	mux := http.NewServeMux()
 
-	for _, routerCfg := range config.Routers {
+	for _, routerCfg := range merged.Routers {
 		cfg := routerCfg
 		var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -99,7 +152,7 @@ func (s *Server) switchConfigs(config Configuration) {
 
 		// Wrap with middleware if configured, using the configuration snapshot
 		if cfg.Middleware != "" {
-			if mwCfg, ok := config.Middlewares[cfg.Middleware]; ok {
+			if mwCfg, ok := merged.Middlewares[cfg.Middleware]; ok {
 				handler = s.buildMiddleware(mwCfg, handler)
 			}
 		}
@@ -118,6 +171,10 @@ func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.H
 	})
 }
 
+func (s *Server) Start(ctx context.Context) {
+	// No watcher needed with provider-based model
+}
+
 func (s *Server) GetEntryPoint(name string) *EntryPoint {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -128,4 +185,8 @@ func (s *Server) GetConfig() Configuration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.currentConfig
+}
+
+func (s *Server) GetConfigVersion() uint64 {
+	return atomic.LoadUint64(&s.configVersion)
 }
