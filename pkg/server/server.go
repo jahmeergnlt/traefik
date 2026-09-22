@@ -56,9 +56,11 @@ func NewServer() *Server {
 		},
 	}
 	// Initialize with a default handler
-	s.entryPoints["web"].handler.Store(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found", http.StatusNotFound)
-	}))
+	})
+	s.entryPoints["web"].handler.Store(mux)
 	return s
 }
 
@@ -85,8 +87,6 @@ func (s *Server) switchConfigs(config Configuration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.currentConfig = config
-
 	// Rebuild the entrypoint handler atomically as a single, immutable unit.
 	mux := http.NewServeMux()
 
@@ -109,6 +109,8 @@ func (s *Server) switchConfigs(config Configuration) {
 
 	// Swap the active entrypoint handler atomically
 	s.entryPoints["web"].handler.Store(mux)
+
+	s.currentConfig = config
 }
 
 func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.Handler {
