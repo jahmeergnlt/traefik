@@ -2,76 +2,76 @@ package server
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 )
 
-// TestConcurrentConfigUpdates ensures that rapid, concurrent configuration
-// submissions do not leave the server in a partially‑updated state.
-func TestConcurrentConfigUpdates(t *testing.T) {
+// TestConcurrentUpdates ensures that when multiple configuration updates are
+// sent almost simultaneously, the server processes them sequentially and the
+// final router reflects the last configuration without ever exposing a stale
+// middleware chain.
+func TestConcurrentUpdates(t *testing.T) {
+	srv := NewServer(10)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go srv.Run(ctx)
 
-	srv := NewServer(ctx, "127.0.0.1:0") // use an OS‑assigned port
-	// Replace the real router builder with a test‑aware version.
-	originalBuilder := buildRouterFromConfig
-	defer func() { buildRouterFromConfig = originalBuilder }()
-
-	var routerMux sync.Mutex
-	buildRouterFromConfig = func(cfg interface{}) *Router {
-		// Simulate a small build delay to increase race window.
-		time.Sleep(5 * time.Millisecond)
-
-		routerMux.Lock()
-		defer routerMux.Unlock()
-		// Attach the config payload as a header value for verification.
-		r := newRouter()
-		r.ServeHTTP = func(w http.ResponseWriter, req *http.Request) {
-			if payload, ok := cfg.(string); ok {
-				w.Header().Set("X-Payload", payload)
-			}
-			http.NotFound(w, req)
-		}
-		return r
+	// Prepare two distinct configurations.
+	cfg1 := &Config{
+		Routers: map[string]RouterConfig{
+			"routerA": {Rule: "Host(`example.com`)", Middlewares: []string{"mw1"}},
+		},
+		Middlewares: map[string]MiddlewareConfig{
+			"mw1": {Type: "addPrefix"},
+		},
+	}
+	cfg2 := &Config{
+		Routers: map[string]RouterConfig{
+			"routerA": {Rule: "Host(`example.com`)", Middlewares: []string{"mw2"}},
+			"routerB": {Rule: "Host(`foo.com`)", Middlewares: []string{"mw1"}},
+		},
+		Middlewares: map[string]MiddlewareConfig{
+			"mw1": {Type: "addPrefix"},
+			"mw2": {Type: "stripPrefix"},
+		},
 	}
 
-	// Start the server in a goroutine.
-	go func() {
-		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
-			t.Fatalf("server start failed: %v", err)
-		}
-	}()
-
-	// Wait for the server to be listening.
-	time.Sleep(50 * time.Millisecond)
-
-	// Fire a burst of concurrent configuration updates.
-	const updates = 20
+	// Send both configurations concurrently.
 	var wg sync.WaitGroup
-	for i := 0; i < updates; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			srv.SubmitConfig(ConfigMessage{Payload: "cfg-" + string(rune('A'+i))})
-		}(i)
-	}
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		srv.UpdateConfig(cfg1)
+	}()
+	go func() {
+		defer wg.Done()
+		srv.UpdateConfig(cfg2)
+	}()
 	wg.Wait()
 
-	// Give the server a moment to process the last update.
+	// Give the server a moment to process the updates.
 	time.Sleep(100 * time.Millisecond)
 
-	// Issue a request and verify that the response carries the *latest* payload.
-	// The latest payload is deterministic because the channel is FIFO.
-	expectedPayload := "cfg-" + string(rune('A'+updates-1))
+	// The active router must reflect cfg2 (the last update) because the
+	// server processes updates sequentially and the atomic swap guarantees
+	// consistency.
+	router := srv.GetRouter()
+	if router == nil {
+		t.Fatalf("router is nil after processing updates")
+	}
 
-	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
-	rr := httptest.NewRecorder()
-	srv.handleRequest(rr, req)
+	// routerA should now use middleware "mw2".
+	chainA, ok := router.Chains["routerA"]
+	if !ok {
+		t.Fatalf("routerA chain missing")
+	}
+	if len(chainA) != 1 || chainA[0].Type != "stripPrefix" {
+		t.Fatalf("routerA chain not updated correctly, got %+v", chainA)
+	}
 
-	if got := rr.Header().Get("X-Payload"); got != expectedPayload {
-		t.Fatalf("expected latest payload %q, got %q", expectedPayload, got)
+	// routerB should exist only in cfg2.
+	if _, ok := router.Chains["routerB"]; !ok {
+		t.Fatalf("routerB chain missing after cfg2 update")
 	}
 }

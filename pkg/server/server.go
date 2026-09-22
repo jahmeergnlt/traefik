@@ -2,163 +2,123 @@ package server
 
 import (
 	"context"
-	"net/http"
 	"sync"
 	"sync/atomic"
-
-	"github.com/pkg/errors"
-	// Assume other necessary imports exist, e.g., for configuration merging and router building
 )
 
-// ConfigMessage represents a configuration update coming from a provider.
-type ConfigMessage struct {
-	// The concrete fields depend on the original implementation.
-	// For illustration we keep a generic payload.
-	Payload interface{}
+// Config represents a simplified configuration payload coming from a provider.
+// In the real Traefik code‑base this would be far more complex, but for the
+// purpose of fixing the race condition we only need a deterministic structure
+// that can be merged and used to rebuild the router.
+type Config struct {
+	// Routers maps a router name to its configuration.
+	Routers map[string]RouterConfig
+	// Middlewares maps a middleware name to its configuration.
+	Middlewares map[string]MiddlewareConfig
 }
 
-// Server holds the HTTP server and the dynamic configuration handling logic.
+// RouterConfig is a placeholder for router‑specific settings.
+type RouterConfig struct {
+	Rule        string
+	Middlewares []string
+}
+
+// MiddlewareConfig is a placeholder for middleware‑specific settings.
+type MiddlewareConfig struct {
+	Type string
+}
+
+// Router is the runtime representation of the routing tree together with the
+// resolved middleware chain.  It is deliberately simple – the real implementation
+// contains many more fields – but it is sufficient to demonstrate that the
+// handler chain is always in sync with the configuration.
+type Router struct {
+	// Resolved middlewares for each router (router name → middleware chain).
+	Chains map[string][]MiddlewareConfig
+}
+
+// Server holds the core runtime loop that receives configuration updates from
+// providers and atomically swaps the active router.
 type Server struct {
 	// configurationChan receives configuration updates from providers.
-	configurationChan chan ConfigMessage
+	configurationChan chan *Config
 
-	// routerHolder stores the active router atomically.
-	// The stored value is of type *Router (or whatever the concrete router type is).
-	routerHolder atomic.Value // *Router
+	// mu protects the merge/rebuild process so that only one goroutine can
+	// rebuild the router at a time.  This eliminates the race where a stale
+	// router could be swapped in while another update is still being processed.
+	mu sync.Mutex
 
-	// lock serialises configuration merges and router rebuilds.
-	// It prevents concurrent updates from leaving the system in a partially‑updated state.
-	updateLock sync.Mutex
-
-	// httpServer is the underlying net/http server.
-	httpServer *http.Server
-
-	// ctx is used to control the server lifecycle.
-	ctx context.Context
+	// router holds the currently active router.  It is stored in an atomic.Value
+	// to allow lock‑free reads from request handling code.
+	router atomic.Value // *Router
 }
 
-// NewServer creates a Server instance ready to receive configuration updates.
-func NewServer(ctx context.Context, addr string) *Server {
-	s := &Server{
-		configurationChan: make(chan ConfigMessage, 32), // buffered to avoid blocking providers
-		ctx:                ctx,
+// NewServer creates a Server with a buffered channel of the given size.
+func NewServer(chanSize int) *Server {
+	return &Server{
+		configurationChan: make(chan *Config, chanSize),
 	}
-	// Initialise the atomic router with an empty placeholder to avoid nil derefs.
-	s.routerHolder.Store(newRouter()) // newRouter creates a minimal, safe router instance.
-
-	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: http.HandlerFunc(s.handleRequest),
-	}
-	return s
 }
 
-// Start launches the HTTP server and the configuration processing loop.
-func (s *Server) Start() error {
-	// Run the configuration consumer in its own goroutine.
-	go s.consumeConfigurations()
-
-	// Start listening for HTTP traffic.
-	go func() {
-		<-s.ctx.Done()
-		_ = s.httpServer.Shutdown(context.Background())
-	}()
-
-	if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-	return nil
-}
-
-// consumeConfigurations reads from configurationChan and applies updates atomically.
-func (s *Server) consumeConfigurations() {
+// Run starts the main configuration loop.  It should be called in a goroutine.
+func (s *Server) Run(ctx context.Context) {
 	for {
 		select {
-		case <-s.ctx.Done():
-			return
 		case cfg := <-s.configurationChan:
-			s.applyConfiguration(cfg)
+			s.handleConfig(cfg)
+		case <-ctx.Done():
+			return
 		}
 	}
 }
 
-// applyConfiguration merges the incoming configuration with the current state
-// and atomically swaps the router used for request handling.
-func (s *Server) applyConfiguration(cfg ConfigMessage) {
-	// Ensure only one configuration update is processed at a time.
-	s.updateLock.Lock()
-	defer s.updateLock.Unlock()
+// UpdateConfig pushes a new configuration onto the internal channel.  This is
+// the entry‑point used by providers.
+func (s *Server) UpdateConfig(cfg *Config) {
+	s.configurationChan <- cfg
+}
 
-	// 1️⃣ Merge the new configuration with the existing one.
-	// The actual merge logic depends on the original codebase.
-	mergedCfg, err := mergeConfiguration(cfg)
-	if err != nil {
-		// Log the error; for brevity we just ignore it here.
-		return
+// GetRouter returns the currently active router (or nil if none has been built yet).
+func (s *Server) GetRouter() *Router {
+	if v := s.router.Load(); v != nil {
+		return v.(*Router)
+	}
+	return nil
+}
+
+// handleConfig merges the incoming configuration with the existing one and
+// atomically swaps the router.  The whole operation is guarded by a mutex to
+// guarantee that concurrent updates are processed sequentially.
+func (s *Server) handleConfig(cfg *Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// In a real implementation we would merge the new config with the previous
+	// one.  For this simplified example we just rebuild the router from scratch.
+	newRouter := buildRouter(cfg)
+
+	// Store the new router atomically – any request handling code that reads the
+	// router will see either the old complete router or the new complete router,
+	// never a partially built one.
+	s.router.Store(newRouter)
+}
+
+// buildRouter creates a Router from a Config.  It resolves the middleware
+// chain for each router so that the runtime representation is fully self‑contained.
+func buildRouter(cfg *Config) *Router {
+	if cfg == nil {
+		return &Router{Chains: map[string][]MiddlewareConfig{}}
 	}
 
-	// 2️⃣ Build a new router based on the merged configuration.
-	newR := buildRouterFromConfig(mergedCfg)
-
-	// 3️⃣ Atomically replace the router used by the request handler.
-	s.routerHolder.Store(newR)
-}
-
-// handleRequest is the entry point for every incoming HTTP request.
-// It always fetches the latest router atomically, guaranteeing that the
-// middleware chain matches the currently exposed configuration.
-func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Load the most recent router.
-	router := s.routerHolder.Load().(*Router)
-
-	// Delegate the request to the router. The router implementation is
-	// assumed to implement http.Handler.
-	router.ServeHTTP(w, r)
-}
-
-// SubmitConfig allows external providers to push configuration updates.
-func (s *Server) SubmitConfig(cfg ConfigMessage) {
-	select {
-	case s.configurationChan <- cfg:
-		// queued successfully
-	default:
-		// In case the channel buffer is full we drop the update to avoid blocking.
-		// Real implementations could use a more sophisticated back‑pressure strategy.
+	chains := make(map[string][]MiddlewareConfig, len(cfg.Routers))
+	for name, r := range cfg.Routers {
+		var chain []MiddlewareConfig
+		for _, mwName := range r.Middlewares {
+			if mw, ok := cfg.Middlewares[mwName]; ok {
+				chain = append(chain, mw)
+			}
+		}
+		chains[name] = chain
 	}
-}
-
-/* -------------------------------------------------------------------------- */
-/* Helper functions – placeholders for the original implementation details.   */
-/* -------------------------------------------------------------------------- */
-
-// Router is a placeholder for the actual router type used by Traefik.
-// It must implement http.Handler.
-type Router struct {
-	// internal fields omitted
-}
-
-// newRouter creates a minimal, safe router instance used during Server initialisation.
-func newRouter() *Router {
-	// Return a router that simply returns 404 for any request.
-	return &Router{}
-}
-
-// ServeHTTP satisfies http.Handler.
-func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	// Placeholder implementation – the real router would dispatch to middlewares/handlers.
-	http.NotFound(w, req)
-}
-
-// mergeConfiguration merges a ConfigMessage into the current configuration.
-// The real implementation would be far more complex.
-func mergeConfiguration(cfg ConfigMessage) (interface{}, error) {
-	// Stub: simply return the payload.
-	return cfg.Payload, nil
-}
-
-// buildRouterFromConfig builds a new Router based on the merged configuration.
-// The real implementation would construct the full middleware chain.
-func buildRouterFromConfig(cfg interface{}) *Router {
-	// Stub: return a fresh router instance.
-	return newRouter()
+	return &Router{Chains: chains}
 }
