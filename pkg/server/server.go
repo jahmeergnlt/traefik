@@ -44,7 +44,7 @@ func (e *EntryPoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type Server struct {
 	configurationChan chan Configuration
 	entryPoints       map[string]*EntryPoint
-	mu                sync.RWMutex
+	mu                sync.Mutex // Serializes configuration updates to prevent race conditions during merges and rebuilds
 	currentConfig     Configuration
 }
 
@@ -119,13 +119,13 @@ func (s *Server) buildMiddleware(cfg MiddlewareConfig, next http.Handler) http.H
 }
 
 func (s *Server) GetEntryPoint(name string) *EntryPoint {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.entryPoints[name]
 }
 
 func (s *Server) GetConfig() Configuration {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.currentConfig
 }
