@@ -1,24 +1,4 @@
-package server
-
-import (
-	"context"
-	"net/http"
-	"net/http/httptest"
-	"sync"
-	"testing"
-	"time"
-)
-
-func TestConcurrentConfigurationUpdates(t *testing.T) {
-	s := NewServer()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	s.Start(ctx)
-
-	// Initial configuration: route1 uses mw1 (Old)
-	initialConfig := Configuration{
-		Routers: map[string]RouterConfig{
+map[string]RouterConfig{
 			"route1": {
 				Path:         "/test",
 				Middleware:   "mw1",
@@ -107,38 +87,51 @@ func TestConcurrentConfigurationUpdates(t *testing.T) {
 		}
 	}()
 
-	// Send a continuous stream of HTTP requests to the router
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ep := s.GetEntryPoint("web")
-		for i := 0; i < 1000; i++ {
-			req := httptest.NewRequest(http.MethodGet, "/test", nil)
-			rec := httptest.NewRecorder()
-			ep.ServeHTTP(rec, req)
+	// Send a continuous stream of HTTP requests to verify consistency
+	var requestCount int64
+	var inconsistentCount int64
 
-			if rec.Code == http.StatusOK {
-				body := rec.Body.String()
-				headerVal := rec.Header().Get("X-Test-Header")
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(1 * time.Millisecond)
+			defer ticker.Stop()
 
-				if body == "New Router" {
-					if headerVal != "New" {
-						t.Errorf("Consistency violation: response body is %q but header is %q", body, headerVal)
+			timeout := time.After(200 * time.Millisecond)
+			for {
+				select {
+				case <-timeout:
+					return
+				case <-ticker.C:
+					rec := httptest.NewRecorder()
+					req := httptest.NewRequest("GET", "/test", nil)
+					
+					s.entryPoints["web"].ServeHTTP(rec, req)
+					atomic.AddInt64(&requestCount, 1)
+
+					body := rec.Body.String()
+					header := rec.Header().Get("X-Test-Header")
+
+					// Inconsistent states to check:
+					// 1. Response says "New Router" but header is "Old" (or vice versa)
+					if body == "New Router" && header != "New" {
+						atomic.AddInt64(&inconsistentCount, 1)
 					}
-				} else if body == "Old Router" {
-					if headerVal != "Old" {
-						t.Errorf("Consistency violation: response body is %q but header is %q", body, headerVal)
+					if body == "Old Router" && header != "Old" {
+						atomic.AddInt64(&inconsistentCount, 1)
 					}
-				} else {
-					t.Errorf("Unexpected response body: %q", body)
 				}
 			}
-			time.Sleep(1 * time.Millisecond)
-		}
-	}()
+		}()
+	}
 
-	// Run the test for a short duration
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(300 * time.Millisecond)
 	close(stopChan)
 	wg.Wait()
+
+	t.Logf("Total requests: %d, Inconsistent responses: %d", atomic.LoadInt64(&requestCount), atomic.LoadInt64(&inconsistentCount))
+	if atomic.LoadInt64(&inconsistentCount) > 0 {
+		t.Fatalf("Detected %d inconsistent responses where router configuration and middleware configuration were mismatched!", atomic.LoadInt64(&inconsistentCount))
+	}
 }
