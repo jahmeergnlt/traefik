@@ -1,7 +1,4 @@
-package server
-
-import (
-	"context"
+context"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -46,6 +43,7 @@ type Server struct {
 	entryPoints       map[string]*EntryPoint
 	mu                sync.RWMutex
 	currentConfig     Configuration
+	updateMu          sync.Mutex
 }
 
 func NewServer() *Server {
@@ -82,10 +80,12 @@ func (s *Server) GetConfigurationChan() chan<- Configuration {
 }
 
 func (s *Server) switchConfigs(config Configuration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
 
+	s.mu.Lock()
 	s.currentConfig = config
+	s.mu.Unlock()
 
 	// Rebuild the entrypoint handler atomically as a single, immutable unit.
 	mux := http.NewServeMux()
